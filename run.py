@@ -8,6 +8,7 @@ import hmac
 import importlib.machinery
 import importlib.util
 import secrets
+import signal
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import uuid
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 
 BASE = Path(__file__).parent.resolve()
 DATA = BASE / "bots"
@@ -29,12 +30,14 @@ PORT = 5000
 SERVER_NAME = "my server"          # name shown in the admin Telegram message
 LOCAL_API = False                  # True = also serve the HTTP API on HOST:PORT (not needed by the app)
 HOST = "127.0.0.1"                 # local API address, only used if LOCAL_API is True
-USE_RELAY = False                  # True = also use the ntfy.sh relay (needs ntfy.sh)
-USE_TUNNEL = True                  # True = also open a cloudflared quick tunnel
+USE_TUNNEL = False                 # True = also open a cloudflared quick tunnel
 NTFY = "https://ntfy.sh"           # relay server
 API_KEY = ""                       # empty = generated once and saved in api_key.txt
 ADMIN_BOT_TOKEN = "8837994471:AAGTMO33uOjJiXoXJ77qRjQ2nHD1y3A5ft8"               # optional: Telegram admin bot token from @BotFather
 ADMIN_CHAT_ID = "8690698115"                 # optional: your own chat id from @userinfobot
+USER_RAM_MB = 120                  # RAM each user may use, all of their bots together (admin: no limit)
+USER_CPU = 0.5                     # CPU cores each user may use, all of their bots together (admin: no limit)
+MAX_CODE = 300_000                 # biggest bot.py accepted, in characters
 
 # API key: the one set above, otherwise generated once and saved in api_key.txt
 KEY_FILE = BASE / "api_key.txt"
@@ -46,18 +49,76 @@ if not API_KEY:
         KEY_FILE.write_text(API_KEY)
         os.chmod(KEY_FILE, 0o600)
 
+# ---- Users: the admin key above, plus one key per user stored in users.json ----
+USERS_FILE = BASE / "users.json"
+USERS = {}  # user id -> {"name": ..., "key": ...}
+users_lock = threading.RLock()
+
+
+def load_users():
+    try:
+        USERS.update(json.loads(USERS_FILE.read_text()))
+    except FileNotFoundError:
+        pass
+    except ValueError:
+        print("users.json is damaged - ignoring it", flush=True)
+
+
+def save_users():
+    with users_lock:
+        tmp = USERS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(USERS))
+        os.chmod(tmp, 0o600)
+        tmp.replace(USERS_FILE)
+
+
+load_users()
+
 app = Flask(__name__)
-procs = {}  # bot id -> subprocess.Popen
+procs = {}      # bot id -> subprocess.Popen
+owner_of = {}   # bot id -> id of the user who owns the running bot
+
+
+def identify(token):
+    """Whose key is this? None if nobody's."""
+    if hmac.compare_digest(token.encode(), API_KEY.encode()):
+        return {"uid": "admin", "name": "Admin", "role": "admin"}
+    for uid, u in list(USERS.items()):
+        if hmac.compare_digest(token.encode(), u["key"].encode()):
+            return {"uid": uid, "name": u["name"], "role": "user"}
+    return None
 
 
 def auth(f):
     @wraps(f)
     def wrapper(*a, **kw):
         got = request.headers.get("Authorization", "")
-        if not hmac.compare_digest(got.encode(), f"Bearer {API_KEY}".encode()):
+        me = identify(got[7:]) if got.startswith("Bearer ") else None
+        if not me:
             return jsonify(error="unauthorized"), 401
+        g.me = me
         return f(*a, **kw)
     return wrapper
+
+
+def admin_only(f):
+    @wraps(f)
+    def wrapper(*a, **kw):
+        if g.me["role"] != "admin":
+            return jsonify(error="forbidden"), 403
+        return f(*a, **kw)
+    return wrapper
+
+
+def can_access(meta, me):
+    return me["role"] == "admin" or meta.get("owner", "admin") == me["uid"]
+
+
+def owner_name(uid):
+    if uid == "admin":
+        return "Admin"
+    u = USERS.get(uid)
+    return u["name"] if u else "?"
 
 
 def bot_dir(bid):
@@ -65,6 +126,19 @@ def bot_dir(bid):
         return None
     d = DATA / bid
     return d if d.is_dir() else None
+
+
+def my_bot(bid):
+    """The bot's folder, but only if the caller owns it (the admin may open
+    any). For anyone else this is None and the route answers 404, so another
+    user's bot can't even be told apart from one that doesn't exist."""
+    d = bot_dir(bid)
+    if not d or not (d / "meta.json").exists():
+        return None
+    try:
+        return d if can_access(read_meta(d), g.me) else None
+    except ValueError:
+        return None
 
 
 def read_meta(d):
@@ -126,23 +200,82 @@ PIP_NAMES = {
 STDLIB = getattr(sys, "stdlib_module_names", set())
 
 
-def needed_packages(d):
-    """Parse bot.py and return pip names for imports that aren't stdlib,
-    aren't files in the bot's own folder, and aren't installed yet."""
+# ---- Packages that are never installed ----
+# import name -> name shown to the user
+BLOCKED_MODULES = {"cv2": "opencv-python", "numpy": "numpy", "ddddocr": "ddddocr"}
+BLOCKED_PIP = {"opencv-python", "opencv-python-headless", "opencv-contrib-python",
+               "opencv-contrib-python-headless", "numpy", "ddddocr"}
+BLOCKED_DIRS = {"numpy", "cv2", "opencv", "ddddocr"}  # first word of their folder names
+
+
+def is_blocked_pip(name):
+    base = re.split(r"[<>=!~\[;\s]", name, maxsplit=1)[0]
+    return re.sub(r"[-_.]+", "-", base).lower() in BLOCKED_PIP
+
+
+def imported_names(d):
+    """Top-level module names bot.py imports, or None if it can't be parsed."""
     try:
         tree = ast.parse((d / "bot.py").read_text())
-    except (SyntaxError, ValueError):
-        return []  # let the bot itself report the syntax error in its log
+    except (SyntaxError, ValueError, OSError):
+        return None
     names = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(a.name.split(".")[0] for a in node.names)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             names.add(node.module.split(".")[0])
+    return names
+
+
+_blocked_cache = {}
+
+
+def blocked_in_code(d):
+    """Blocked packages that bot.py imports (cached until the file changes)."""
+    f = d / "bot.py"
+    try:
+        mt = f.stat().st_mtime_ns
+    except OSError:
+        return []
+    hit = _blocked_cache.get(str(f))
+    if hit and hit[0] == mt:
+        return hit[1]
+    res = sorted({BLOCKED_MODULES[n] for n in (imported_names(d) or ()) if n in BLOCKED_MODULES})
+    _blocked_cache[str(f)] = (mt, res)
+    return res
+
+
+def purge_blocked(libs, log):
+    """Delete blocked packages that arrived as a dependency of something else."""
+    removed = []
+    try:
+        for p in libs.iterdir():
+            first = re.split(r"[-.]", p.name.lower().replace("_", "-"))[0]
+            if first in BLOCKED_DIRS:
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink()
+                removed.append(p.name)
+    except Exception:
+        return
+    if removed:
+        log.write(b"--- removed blocked packages that came in as a dependency ---\n")
+        log.flush()
+
+
+def needed_packages(d):
+    """Parse bot.py and return pip names for imports that aren't stdlib,
+    aren't files in the bot's own folder, and aren't installed yet.
+    Blocked packages are never returned."""
+    names = imported_names(d)
+    if names is None:
+        return []  # let the bot itself report the syntax error in its log
     libs = d / "libs"
     missing = []
     for n in sorted(names):
-        if n in STDLIB or n == "__future__":
+        if n in STDLIB or n == "__future__" or n in BLOCKED_MODULES:
             continue
         if (d / f"{n}.py").exists() or (d / n).is_dir():
             continue  # the bot's own module
@@ -165,6 +298,10 @@ started_at = {}      # bot id -> time the process was launched
 
 def pip_install(pkg, libs, log):
     """Install one package into the bot's libs/ folder. Returns True on success."""
+    if is_blocked_pip(pkg):
+        log.write(f"--- {pkg} is blocked and will never be installed ---\n".encode())
+        log.flush()
+        return False
     log.write(f"--- installing {pkg} ---\n".encode())
     log.flush()
     try:
@@ -187,7 +324,7 @@ def install_packages(d, log, bid, extra=()):
     """Install whatever bot.py imports but isn't installed yet (plus any extra
     packages), one at a time so a single failure doesn't block the rest. Goes
     into the bot's own libs/ folder so bots never clash on versions."""
-    pkgs = list(dict.fromkeys(list(extra) + needed_packages(d)))
+    pkgs = [p for p in dict.fromkeys(list(extra) + needed_packages(d)) if not is_blocked_pip(p)]
     if not pkgs:
         return
     libs = d / "libs"
@@ -215,6 +352,7 @@ def launch_bot(bid, d, retries=0, tried=frozenset(), extra=()):
         env = os.environ.copy()
         env.pop("API_KEY", None)  # don't hand the server key to bot code
         env["BOT_TOKEN"] = meta["token"]
+        owner_of[bid] = meta.get("owner", "admin")
         logf = d / "log.txt"
         if logf.exists() and logf.stat().st_size > 1_000_000:
             logf.write_bytes(logf.read_bytes()[-200_000:])
@@ -222,6 +360,8 @@ def launch_bot(bid, d, retries=0, tried=frozenset(), extra=()):
             log.write(b"\n--- starting ---\n")
             log.flush()
             install_packages(d, log, bid, extra)
+            if (d / "libs").is_dir():
+                purge_blocked(d / "libs", log)
         if bid in cancelled or not d.is_dir():
             return
         libs = d / "libs"
@@ -232,6 +372,7 @@ def launch_bot(bid, d, retries=0, tried=frozenset(), extra=()):
             proc = subprocess.Popen(
                 [sys.executable, "-u", "bot.py"],
                 cwd=d, env=env, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True,  # own process group: the limiter can pause / kill it as a unit
             )
         procs[bid] = proc
         started_at[bid] = time.time()
@@ -269,6 +410,13 @@ def watch_bot(bid, d, proc, log_pos, retries, tried):
     if not found:
         return
     mod = found[-1].split(".")[0]
+    if mod in BLOCKED_MODULES:
+        try:
+            with open(d / "log.txt", "ab") as log:
+                log.write(f"--- '{mod}' is blocked and is never installed on this server ---\n".encode())
+        except Exception:
+            pass
+        return
     pkg = PIP_NAMES.get(mod, mod)
     if pkg in tried or mod in STDLIB or (d / f"{mod}.py").exists() or (d / mod).is_dir():
         return
@@ -286,41 +434,82 @@ def watch_bot(bid, d, proc, log_pos, retries, tried):
 def start_bot(bid, d):
     if is_running(bid) or bid in starting:
         return
+    bl = blocked_in_code(d)
+    if bl:
+        try:
+            with open(d / "log.txt", "ab") as log:
+                log.write(("--- NOT STARTED: bot.py uses " + ", ".join(bl) + ". These packages are "
+                           "never installed on this server. Remove them and upload the file again. ---\n").encode())
+        except Exception:
+            pass
+        return
     cancelled.discard(bid)
     starting.add(bid)
     threading.Thread(target=launch_bot, args=(bid, d), daemon=True).start()
+
+
+def killgroup(pid, sig):
+    try:
+        os.killpg(pid, sig)
+    except Exception:
+        pass
 
 
 def stop_bot(bid):
     if bid in starting:
         cancelled.add(bid)  # the launch thread notices and gives up
     d = bot_dir(bid)
-    if d:
-        kill_orphan(d)
     p = procs.pop(bid, None)
     started_at.pop(bid, None)
+    owner_of.pop(bid, None)
     if p and p.poll() is None:
-        p.terminate()
+        killgroup(p.pid, signal.SIGCONT)  # the CPU limiter may have it paused
+    if d:
+        kill_orphan(d)
+    if p and p.poll() is None:
+        killgroup(p.pid, signal.SIGTERM)
         try:
             p.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            killgroup(p.pid, signal.SIGKILL)
             p.kill()
 
 
 @app.get("/api/ping")
 @auth
 def ping():
-    return jsonify(ok=True)
+    return jsonify(ok=True, role=g.me["role"], name=g.me["name"],
+                   ram_mb=USER_RAM_MB, cpu=USER_CPU)
+
+
+def bot_info(d, m):
+    bid = d.name
+    st = STATS.get("bots", {}).get(bid, {})
+    return {"id": bid, "name": m["name"], "owner": owner_name(m.get("owner", "admin")),
+            "running": is_running(bid), "starting": bid in starting,
+            "installing": bid in installing, "blocked": blocked_in_code(d),
+            "cpu": st.get("cpu"), "mem": st.get("mem")}
+
+
+def visible_bots():
+    """(folder, meta) of every bot the caller may see: their own, or all for the admin."""
+    out = []
+    for d in DATA.iterdir():
+        if (d / "meta.json").exists():
+            try:
+                m = read_meta(d)
+            except ValueError:
+                continue
+            if can_access(m, g.me):
+                out.append((d, m))
+    return out
 
 
 @app.get("/api/bots")
 @auth
 def list_bots():
-    out = []
-    for d in sorted(DATA.iterdir()):
-        if (d / "meta.json").exists():
-            m = read_meta(d)
-            out.append({"id": d.name, "name": m["name"], "running": is_running(d.name)})
+    out = [bot_info(d, m) for d, m in visible_bots()]
+    out.sort(key=lambda b: b["name"].lower())
     return jsonify(out)
 
 
@@ -331,7 +520,8 @@ def create_bot():
     bid = uuid.uuid4().hex
     d = DATA / bid
     d.mkdir()
-    write_meta(d, {"name": body.get("name") or "My bot", "token": body.get("token", "")})
+    write_meta(d, {"name": str(body.get("name") or "My bot")[:60],
+                   "token": str(body.get("token", "")), "owner": g.me["uid"]})
     (d / "bot.py").write_text("")
     return jsonify(id=bid)
 
@@ -339,35 +529,39 @@ def create_bot():
 @app.get("/api/bots/<bid>")
 @auth
 def get_bot(bid):
-    d = bot_dir(bid)
+    d = my_bot(bid)
     if not d:
         return jsonify(error="not found"), 404
     m = read_meta(d)
-    return jsonify(name=m["name"], token=m["token"], code=(d / "bot.py").read_text())
+    return jsonify(name=m["name"], token=m["token"],
+                   size=(d / "bot.py").stat().st_size, blocked=blocked_in_code(d))
 
 
 @app.put("/api/bots/<bid>")
 @auth
 def update_bot(bid):
-    d = bot_dir(bid)
+    d = my_bot(bid)
     if not d:
         return jsonify(error="not found"), 404
     body = request.get_json(silent=True) or {}
+    code = body.get("code")
+    if code is not None and (not isinstance(code, str) or len(code) > MAX_CODE):
+        return jsonify(error="file too large"), 400
     m = read_meta(d)
     if "name" in body:
-        m["name"] = body["name"]
+        m["name"] = str(body["name"])[:60]
     if "token" in body:
-        m["token"] = body["token"]
+        m["token"] = str(body["token"])
     write_meta(d, m)
-    if "code" in body:
-        (d / "bot.py").write_text(body["code"])
-    return jsonify(ok=True)
+    if code is not None:
+        (d / "bot.py").write_text(code)
+    return jsonify(ok=True, blocked=blocked_in_code(d))
 
 
 @app.delete("/api/bots/<bid>")
 @auth
 def delete_bot(bid):
-    d = bot_dir(bid)
+    d = my_bot(bid)
     if not d:
         return jsonify(error="not found"), 404
     stop_bot(bid)
@@ -379,7 +573,7 @@ def delete_bot(bid):
 @app.post("/api/bots/<bid>/<action>")
 @auth
 def control(bid, action):
-    d = bot_dir(bid)
+    d = my_bot(bid)
     if not d:
         return jsonify(error="not found"), 404
     if action == "start":
@@ -391,13 +585,15 @@ def control(bid, action):
         start_bot(bid, d)
     else:
         return jsonify(error="bad action"), 400
-    return jsonify(ok=True, running=is_running(bid) or bid in starting)
+    blocked = blocked_in_code(d)
+    return jsonify(ok=not blocked or action == "stop",
+                   running=is_running(bid) or bid in starting, blocked=blocked)
 
 
 @app.get("/api/bots/<bid>/logs")
 @auth
 def logs(bid):
-    d = bot_dir(bid)
+    d = my_bot(bid)
     if not d:
         return jsonify(error="not found"), 404
     f = d / "log.txt"
@@ -405,27 +601,88 @@ def logs(bid):
     st = STATS.get("bots", {}).get(bid, {})
     up = int(time.time() - started_at[bid]) if is_running(bid) and bid in started_at else None
     return jsonify(running=is_running(bid), starting=bid in starting,
-                   installing=bid in installing, log=text,
+                   installing=bid in installing, log=text, blocked=blocked_in_code(d),
                    cpu=st.get("cpu"), mem=st.get("mem"), uptime=up)
 
 
 @app.get("/api/overview")
 @auth
 def overview():
-    """Everything the home screen needs in one call: the bots and the server's
-    CPU / RAM / disk, so the app only makes a single request per refresh."""
-    bots = []
-    for d in DATA.iterdir():
-        if (d / "meta.json").exists():
-            st = STATS.get("bots", {}).get(d.name, {})
-            bots.append({"id": d.name, "name": read_meta(d)["name"],
-                         "running": is_running(d.name), "starting": d.name in starting,
-                         "installing": d.name in installing,
-                         "cpu": st.get("cpu"), "mem": st.get("mem")})
+    """Everything the home screen needs in one call. The admin gets every bot and
+    the server's CPU / RAM / disk; a user gets only their own bots and their own
+    quota usage (nothing about the server or other users)."""
+    bots = [bot_info(d, m) for d, m in visible_bots()]
     bots.sort(key=lambda b: b["name"].lower())
-    stats = {k: v for k, v in STATS.items() if k != "bots"}
+    if g.me["role"] == "admin":
+        stats = {k: v for k, v in STATS.items() if k != "bots"}
+    else:
+        u = USAGE.get(g.me["uid"]) or {"cpu": 0.0, "ram": 0.0}
+        stats = {"cpu": u["cpu"], "cores": USER_CPU, "mem_used": u["ram"],
+                 "mem_total": USER_RAM_MB, "disk_used": None, "disk_total": None}
     stats["uptime"] = int(time.time() - START_TS)
     return jsonify(bots=bots, stats=stats)
+
+
+# ---- Users (admin only) ----
+@app.get("/api/users")
+@auth
+@admin_only
+def list_users():
+    count = {}
+    for d in DATA.iterdir():
+        if (d / "meta.json").exists():
+            try:
+                uid = read_meta(d).get("owner", "admin")
+            except ValueError:
+                continue
+            c = count.setdefault(uid, [0, 0])
+            c[0] += 1
+            c[1] += 1 if is_running(d.name) else 0
+    out = [{"id": uid, "name": u["name"], "key": u["key"],
+            "bots": count.get(uid, [0, 0])[0], "running": count.get(uid, [0, 0])[1]}
+           for uid, u in list(USERS.items())]
+    out.sort(key=lambda u: u["name"].lower())
+    return jsonify(users=out, ram_mb=USER_RAM_MB, cpu=USER_CPU)
+
+
+@app.post("/api/users")
+@auth
+@admin_only
+def create_user():
+    name = str((request.get_json(silent=True) or {}).get("name", "")).strip()[:40]
+    if not name:
+        return jsonify(error="name required"), 400
+    uid, key = uuid.uuid4().hex[:12], secrets.token_urlsafe(24)
+    with users_lock:
+        USERS[uid] = {"name": name, "key": key}
+        save_users()
+    start_user_relay(key)
+    return jsonify(id=uid, key=key)
+
+
+@app.delete("/api/users/<uid>")
+@auth
+@admin_only
+def delete_user(uid):
+    with users_lock:
+        u = USERS.pop(uid, None)
+        if u:
+            save_users()
+    if not u:
+        return jsonify(error="not found"), 404
+    stop_user_relay(u["key"])
+    for d in list(DATA.iterdir()):
+        if (d / "meta.json").exists():
+            try:
+                mine = read_meta(d).get("owner", "admin") == uid
+            except ValueError:
+                continue
+            if mine:
+                stop_bot(d.name)
+                kill_orphan(d)
+                shutil.rmtree(d, ignore_errors=True)
+    USAGE.pop(uid, None)
+    return jsonify(ok=True)
 
 
 def topic():
@@ -437,10 +694,8 @@ def publish_url(url):
     try:
         req = urllib.request.Request(f"https://ntfy.sh/{topic()}", data=url.encode(), method="POST")
         urllib.request.urlopen(req, timeout=10).read()
-        return True
     except Exception as e:
         print("Could not publish link:", e, flush=True)
-        return False
 
 
 # ---- Resource monitor (reads /proc and cgroups; no extra packages) ----
@@ -576,6 +831,97 @@ def stats_loop():
         time.sleep(3)
 
 
+# ---- Per-user limits: RAM and CPU for all of one user's bots together ----
+# RAM: if a user's bots use more than USER_RAM_MB, the biggest one is killed.
+# CPU: each second a user may burn USER_CPU * 1 s of CPU time; once that is used
+#      up their bots are paused (SIGSTOP) until the second is over (SIGCONT).
+# The admin's own bots are not limited. Needs Linux (/proc).
+USAGE = {}  # user id -> {"cpu": % of their CPU quota, "ram": MB}
+
+
+def scan_procs():
+    """pid -> (session id, cpu ticks, rss pages) for every process."""
+    out = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            data = Path(f"/proc/{name}/stat").read_text()
+            rest = data[data.rindex(")") + 2:].split()
+            out[int(name)] = (int(rest[3]), int(rest[11]) + int(rest[12]), int(rest[21]))
+        except Exception:
+            continue
+    return out
+
+
+def limiter_loop():
+    try:
+        clk = os.sysconf("SC_CLK_TCK")
+        page = os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        clk, page = 100, 4096
+    window = 1.0
+    last = {}   # pid -> cpu ticks seen last time
+    st = {}     # user id -> window state
+    while True:
+        time.sleep(0.1)
+        try:
+            groups = {}  # user id -> {bot id: process group id}
+            for bid, p in list(procs.items()):
+                uid = owner_of.get(bid, "admin")
+                if uid != "admin" and p.poll() is None:
+                    groups.setdefault(uid, {})[bid] = p.pid
+            for uid in [u for u in st if u not in groups]:
+                del st[uid]
+            if not groups:
+                last.clear()
+                time.sleep(0.4)
+                continue
+            snap = scan_procs()
+            now = time.time()
+            seen = {}
+            for uid, bots in groups.items():
+                s_ = st.setdefault(uid, {"start": now, "used": 0, "stopped": False})
+                by_sid = {pid: bid for bid, pid in bots.items()}
+                rss = {bid: 0 for bid in bots}
+                for pid, (sid, ticks, pages) in snap.items():
+                    bid = by_sid.get(sid)
+                    if bid is None:
+                        continue
+                    seen[pid] = ticks
+                    s_["used"] += max(0, ticks - last.get(pid, 0))
+                    rss[bid] += pages * page
+                ram_mb = sum(rss.values()) / 1048576
+                if ram_mb > USER_RAM_MB:
+                    big = max(rss, key=rss.get)
+                    msg = (f"--- STOPPED: memory limit exceeded ({ram_mb:.0f} MB used, "
+                           f"limit {USER_RAM_MB} MB for all your bots together) ---\n")
+                    try:
+                        with open(DATA / big / "log.txt", "ab") as log:
+                            log.write(msg.encode())
+                    except Exception:
+                        pass
+                    killgroup(bots[big], signal.SIGCONT)
+                    killgroup(bots[big], signal.SIGKILL)
+                if not s_["stopped"] and s_["used"] >= USER_CPU * clk * window:
+                    for pid in bots.values():
+                        killgroup(pid, signal.SIGSTOP)
+                    s_["stopped"] = True
+                if now - s_["start"] >= window:
+                    cores = s_["used"] / clk / (now - s_["start"])
+                    USAGE[uid] = {"cpu": round(min(100.0, cores / USER_CPU * 100), 1),
+                                  "ram": round(ram_mb, 1)}
+                    if s_["stopped"]:
+                        for pid in bots.values():
+                            killgroup(pid, signal.SIGCONT)
+                        s_["stopped"] = False
+                    s_["used"], s_["start"] = 0, now
+            last = seen
+        except Exception as e:
+            print("Limiter error:", e, flush=True)
+            time.sleep(1)
+
+
 # ---- Admin Telegram bot (optional) ----
 # Fill ADMIN_BOT_TOKEN and ADMIN_CHAT_ID in the Settings block at the top to
 # get a message when the server comes online and to be able to message the
@@ -626,45 +972,16 @@ def poll_admin_bot():
                 text = (msg.get("text") or "").strip().lower()
                 if text in ("/key", "/status", "key", "status"):
                     where = current_url or f"no tunnel (listening on port {PORT})"
-                    notify_admin(f"Enter in app:\n{API_KEY}@{current_url}" if current_url else f"Key: {API_KEY}\nURL: {where}")
+                    notify_admin(f"Key: {API_KEY}\nURL: {where}")
         except Exception as e:
             print("Admin bot poll error:", e, flush=True)
             time.sleep(5)
 
 
-def get_cloudflared():
-    """Find cloudflared, or download it next to run.py if it is missing."""
-    exe = shutil.which("cloudflared")
-    if exe:
-        return exe
-    local = BASE / "cloudflared"
-    if local.exists():
-        return str(local)
-    import platform
-    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64",
-            "arm64": "arm64", "armv7l": "arm", "armv8l": "arm"}.get(platform.machine().lower())
-    if not arch:
-        print("cloudflared: unsupported CPU", platform.machine(), flush=True)
-        return None
-    url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
-    try:
-        print("Downloading cloudflared ...", flush=True)
-        urllib.request.urlretrieve(url, str(local))
-        os.chmod(local, 0o755)
-        return str(local)
-    except Exception as e:
-        print("Could not download cloudflared:", e, flush=True)
-        try:
-            local.unlink()
-        except FileNotFoundError:
-            pass
-        return None
-
-
 def start_tunnel():
-    exe = get_cloudflared()
+    exe = shutil.which("cloudflared")
     if not exe:
-        print("cloudflared not available. Tunnel skipped.", flush=True)
+        print("cloudflared not found. Install it first.")
         return False
     p = subprocess.Popen(
         [exe, "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"],
@@ -673,8 +990,8 @@ def start_tunnel():
 
     def republish(url):
         while p.poll() is None:
-            ok = publish_url(url)
-            time.sleep(1800 if ok else 60)  # failed (e.g. 429)? retry in a minute
+            publish_url(url)
+            time.sleep(1800)
 
     def watch():
         announced = False
@@ -684,13 +1001,12 @@ def start_tunnel():
                 announced = True
                 global current_url
                 current_url = m.group(0)
-                print("\n=== Enter this in the app (key + tunnel link) ===")
-                print(f"{API_KEY}@{current_url}")
-                print("==================================================\n", flush=True)
+                print("\n=== Enter this key in the app (only once) ===")
+                print(API_KEY)
+                print("==============================================\n", flush=True)
                 name = SERVER_NAME
-                notify_admin(f"{name} is online.\nEnter in app:\n{API_KEY}@{current_url}")
-                if USE_RELAY:  # only publish the link to ntfy.sh if ntfy is wanted
-                    threading.Thread(target=republish, args=(current_url,), daemon=True).start()
+                notify_admin(f"{name} is online.\nKey: {API_KEY}\nURL: {current_url}")
+                threading.Thread(target=republish, args=(current_url,), daemon=True).start()
 
     threading.Thread(target=watch, daemon=True).start()
     return True
@@ -705,18 +1021,20 @@ def start_tunnel():
 NTFY = NTFY.rstrip("/")
 CHUNK = 3000       # ntfy messages are limited to ~4 KB, so big payloads are split
 MAX_AGE = 120      # requests older than this (seconds) are ignored (anti-replay)
-_aes = None
-_seen = {}         # request id -> time handled
-_partial = {}      # request id -> chunks received so far
+_aes = {}          # key -> AESGCM
+_seen = {}         # (key, request id) -> time handled
+_partial = {}      # (key, request id) -> chunks received so far
+relays = {}        # key -> Event that stops that key's listener
+# Every key (the admin's and each user's) has its own pair of ntfy topics and its
+# own encryption key, so a user can only ever talk to the server as themselves.
 
 
-def relay_topic(kind):
-    return "bh" + kind + "-" + hashlib.sha256(f"{kind}:{API_KEY}".encode()).hexdigest()[:32]
+def relay_topic(kind, key):
+    return "bh" + kind + "-" + hashlib.sha256(f"{kind}:{key}".encode()).hexdigest()[:32]
 
 
-def get_aes():
-    global _aes
-    if _aes is None:
+def get_aes(key):
+    if key not in _aes:
         try:
             import cryptography  # noqa: F401
         except ImportError:
@@ -726,21 +1044,21 @@ def get_aes():
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-        key = HKDF(algorithm=hashes.SHA256(), length=32,
-                   salt=b"bh-relay-v1", info=b"aes-key").derive(API_KEY.encode())
-        _aes = AESGCM(key)
-    return _aes
+        k = HKDF(algorithm=hashes.SHA256(), length=32,
+                 salt=b"bh-relay-v1", info=b"aes-key").derive(key.encode())
+        _aes[key] = AESGCM(k)
+    return _aes[key]
 
 
-def seal(obj, tag):
+def seal(obj, tag, key):
     nonce = os.urandom(12)
-    ct = get_aes().encrypt(nonce, json.dumps(obj).encode(), tag)
+    ct = get_aes(key).encrypt(nonce, json.dumps(obj).encode(), tag)
     return base64.urlsafe_b64encode(nonce + ct).decode()
 
 
-def unseal(text, tag):
+def unseal(text, tag, key):
     raw = base64.urlsafe_b64decode(text.encode())
-    return json.loads(get_aes().decrypt(raw[:12], raw[12:], tag))
+    return json.loads(get_aes(key).decrypt(raw[:12], raw[12:], tag))
 
 
 def ntfy_post(topic, text):
@@ -755,35 +1073,35 @@ def ntfy_post(topic, text):
     return False
 
 
-def send_response(rid, obj):
-    packet = seal(obj, b"r")
+def send_response(rid, obj, key):
+    packet = seal(obj, b"r", key)
     parts = [packet[i:i + CHUNK] for i in range(0, len(packet), CHUNK)] or [""]
     for idx, part in enumerate(parts):
-        ntfy_post(relay_topic("r"),
+        ntfy_post(relay_topic("r", key),
                   json.dumps({"i": rid, "p": idx, "t": len(parts), "d": part}))
         time.sleep(0.2)
 
 
-def process_request(rid, req):
-    """Run an app request through the normal Flask routes, so the relay and the
-    HTTP API always behave the same."""
+def process_request(rid, req, key):
+    """Run an app request through the normal Flask routes, signed with the key it
+    arrived on, so the relay and the HTTP API always behave (and check access) the same."""
     try:
         method = str(req.get("method", "GET")).upper()
         path = str(req.get("path", ""))
         if method not in ("GET", "POST", "PUT", "DELETE") or not path.startswith("/api/"):
             out = {"id": rid, "status": 400, "data": {"error": "bad request"}}
         else:
-            kw = {"headers": {"Authorization": f"Bearer {API_KEY}"}}
+            kw = {"headers": {"Authorization": f"Bearer {key}"}}
             if req.get("body") is not None:
                 kw["json"] = req["body"]
             resp = app.test_client().open(path, method=method, **kw)
             out = {"id": rid, "status": resp.status_code, "data": resp.get_json(silent=True)}
     except Exception as e:
         out = {"id": rid, "status": 500, "data": {"error": str(e)}}
-    send_response(rid, out)
+    send_response(rid, out, key)
 
 
-def handle_packet(message):
+def handle_packet(message, key):
     try:
         m = json.loads(message)
         rid, idx, total, data = str(m["i"]), int(m["p"]), int(m["t"]), m["d"]
@@ -796,32 +1114,35 @@ def handle_packet(message):
         del _partial[k]
     for k in [k for k, t in _seen.items() if now - t > MAX_AGE * 2]:
         del _seen[k]
-    if rid in _seen:
+    sk = (key, rid)
+    if sk in _seen:
         return
-    buf = _partial.setdefault(rid, {"t": total, "parts": {}, "ts": now})
+    buf = _partial.setdefault(sk, {"t": total, "parts": {}, "ts": now})
     if buf["t"] != total:
         return
     buf["parts"][idx] = data
     if len(buf["parts"]) < buf["t"]:
         return
-    del _partial[rid]
+    del _partial[sk]
     try:
-        req = unseal("".join(buf["parts"][i] for i in range(buf["t"])), b"q")
+        req = unseal("".join(buf["parts"][i] for i in range(buf["t"])), b"q", key)
         if abs(now - float(req.get("ts", 0))) > MAX_AGE:
             return  # too old / replayed
     except Exception:
         return  # wrong key, tampered, or garbage: ignore silently
-    _seen[rid] = now
-    threading.Thread(target=process_request, args=(rid, req), daemon=True).start()
+    _seen[sk] = now
+    threading.Thread(target=process_request, args=(rid, req, key), daemon=True).start()
 
 
-def relay_loop():
+def relay_loop(key, stop):
     since = "30s"  # also pick up a command sent just before the server started
-    while True:
+    while not stop.is_set():
         try:
-            with urllib.request.urlopen(f"{NTFY}/{relay_topic('q')}/json?since={since}",
+            with urllib.request.urlopen(f"{NTFY}/{relay_topic('q', key)}/json?since={since}",
                                         timeout=100) as r:
                 for raw in r:
+                    if stop.is_set():
+                        break
                     try:
                         ev = json.loads(raw)
                     except ValueError:
@@ -829,19 +1150,37 @@ def relay_loop():
                     if ev.get("event") != "message":
                         continue
                     since = str(ev.get("time", since))
-                    handle_packet(ev.get("message", ""))
+                    handle_packet(ev.get("message", ""), key)
         except Exception as e:
             print("Relay reconnecting:", e, flush=True)
             time.sleep(5)
+        else:
+            time.sleep(1)
+
+
+def start_user_relay(key):
+    if key in relays:
+        return
+    stop = threading.Event()
+    relays[key] = stop
+    threading.Thread(target=relay_loop, args=(key, stop), daemon=True).start()
+
+
+def stop_user_relay(key):
+    stop = relays.pop(key, None)
+    if stop:
+        stop.set()
 
 
 def start_relay():
     try:
-        get_aes()
+        get_aes(API_KEY)
     except Exception as e:
         print("Relay disabled (could not load 'cryptography'):", e, flush=True)
         return False
-    threading.Thread(target=relay_loop, daemon=True).start()
+    start_user_relay(API_KEY)
+    for u in list(USERS.values()):
+        start_user_relay(u["key"])
     return True
 
 
@@ -853,10 +1192,10 @@ if __name__ == "__main__":
     use_local = LOCAL_API or USE_TUNNEL
     tunnel = USE_TUNNEL and start_tunnel()
     threading.Thread(target=stats_loop, daemon=True).start()
-    relay = USE_RELAY and start_relay()
+    threading.Thread(target=limiter_loop, daemon=True).start()
+    relay = start_relay()
     name = SERVER_NAME
-    if not tunnel:
-        print(f"\n=== Enter this key in the app ===\n{API_KEY}\n=================================")
+    print(f"\n=== Enter this key in the app ===\n{API_KEY}\n=================================")
     print(f"Relay: {'on' if relay else 'OFF'}   Tunnel: {'on' if tunnel else 'off'}   "
           f"Local API: {f'http://{HOST}:{PORT}' if use_local else 'off'}\n", flush=True)
     if not tunnel:
