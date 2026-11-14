@@ -30,7 +30,7 @@ PORT = 5000
 SERVER_NAME = "my server"          # name shown in the admin Telegram message
 LOCAL_API = False                  # True = also serve the HTTP API on HOST:PORT (not needed by the app)
 HOST = "127.0.0.1"                 # local API address, only used if LOCAL_API is True
-USE_TUNNEL = False                 # True = also open a cloudflared quick tunnel
+USE_TUNNEL = True                  # True = open a cloudflared quick tunnel; the app finds its link by itself (needs cloudflared)
 NTFY = "https://ntfy.sh"           # relay server
 API_KEY = ""                       # empty = generated once and saved in api_key.txt
 ADMIN_BOT_TOKEN = "8837994471:AAGTMO33uOjJiXoXJ77qRjQ2nHD1y3A5ft8"               # optional: Telegram admin bot token from @BotFather
@@ -657,6 +657,8 @@ def create_user():
         USERS[uid] = {"name": name, "key": key}
         save_users()
     start_user_relay(key)
+    if current_url:  # tunnel already up: give the new user the link right away
+        threading.Thread(target=publish_url, args=(current_url, [key]), daemon=True).start()
     return jsonify(id=uid, key=key)
 
 
@@ -685,17 +687,23 @@ def delete_user(uid):
     return jsonify(ok=True)
 
 
-def topic():
-    return "bh-" + hashlib.sha256(API_KEY.encode()).hexdigest()[:32]
+def link_topic(key):
+    """ntfy topic where the tunnel link is published for one key (admin or user).
+    The app computes the same name from its own key."""
+    return "bh-" + hashlib.sha256(key.encode()).hexdigest()[:32]
 
 
-def publish_url(url):
-    """Publish the current tunnel link so the app can find it by itself."""
-    try:
-        req = urllib.request.Request(f"https://ntfy.sh/{topic()}", data=url.encode(), method="POST")
-        urllib.request.urlopen(req, timeout=10).read()
-    except Exception as e:
-        print("Could not publish link:", e, flush=True)
+def publish_url(url, keys=None):
+    """Publish the current tunnel link so the app can find it by itself. Every
+    key (the admin's and each user's) gets the link on its own topic."""
+    if keys is None:
+        keys = [API_KEY] + [u["key"] for u in list(USERS.values())]
+    for key in keys:
+        try:
+            req = urllib.request.Request(f"{NTFY}/{link_topic(key)}", data=url.encode(), method="POST")
+            urllib.request.urlopen(req, timeout=10).read()
+        except Exception as e:
+            print("Could not publish link:", e, flush=True)
 
 
 # ---- Resource monitor (reads /proc and cgroups; no extra packages) ----
@@ -971,8 +979,10 @@ def poll_admin_bot():
                     continue  # ignore anyone who isn't the admin
                 text = (msg.get("text") or "").strip().lower()
                 if text in ("/key", "/status", "key", "status"):
-                    where = current_url or f"no tunnel (listening on port {PORT})"
-                    notify_admin(f"Key: {API_KEY}\nURL: {where}")
+                    if current_url:
+                        notify_admin(f"{SERVER_NAME} is online.\nEnter in app:\n{API_KEY}@{current_url}")
+                    else:
+                        notify_admin(f"{SERVER_NAME}: no tunnel yet.\nKey: {API_KEY}")
         except Exception as e:
             print("Admin bot poll error:", e, flush=True)
             time.sleep(5)
@@ -1001,11 +1011,11 @@ def start_tunnel():
                 announced = True
                 global current_url
                 current_url = m.group(0)
-                print("\n=== Enter this key in the app (only once) ===")
-                print(API_KEY)
+                print("\n=== Enter this in the app (only once) ===")
+                print(f"{API_KEY}@{current_url}")
                 print("==============================================\n", flush=True)
                 name = SERVER_NAME
-                notify_admin(f"{name} is online.\nKey: {API_KEY}\nURL: {current_url}")
+                notify_admin(f"{name} is online.\nEnter in app:\n{API_KEY}@{current_url}")
                 threading.Thread(target=republish, args=(current_url,), daemon=True).start()
 
     threading.Thread(target=watch, daemon=True).start()
