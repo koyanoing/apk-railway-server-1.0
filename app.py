@@ -30,7 +30,8 @@ PORT = 5000
 SERVER_NAME = "my server"          # name shown in the admin Telegram message
 LOCAL_API = False                  # True = also serve the HTTP API on HOST:PORT (not needed by the app)
 HOST = "127.0.0.1"                 # local API address, only used if LOCAL_API is True
-USE_TUNNEL = True                  # True = open a cloudflared quick tunnel; the app finds its link by itself (needs cloudflared)
+USE_RELAY = False                  # True = also use the ntfy.sh relay (needs ntfy.sh)
+USE_TUNNEL = True                  # True = also open a cloudflared quick tunnel (downloaded automatically if missing)
 NTFY = "https://ntfy.sh"           # relay server
 API_KEY = ""                       # empty = generated once and saved in api_key.txt
 ADMIN_BOT_TOKEN = "8837994471:AAGTMO33uOjJiXoXJ77qRjQ2nHD1y3A5ft8"               # optional: Telegram admin bot token from @BotFather
@@ -642,7 +643,7 @@ def list_users():
             "bots": count.get(uid, [0, 0])[0], "running": count.get(uid, [0, 0])[1]}
            for uid, u in list(USERS.items())]
     out.sort(key=lambda u: u["name"].lower())
-    return jsonify(users=out, ram_mb=USER_RAM_MB, cpu=USER_CPU)
+    return jsonify(users=out, ram_mb=USER_RAM_MB, cpu=USER_CPU, link=current_url)
 
 
 @app.post("/api/users")
@@ -656,9 +657,10 @@ def create_user():
     with users_lock:
         USERS[uid] = {"name": name, "key": key}
         save_users()
-    start_user_relay(key)
-    if current_url:  # tunnel already up: give the new user the link right away
-        threading.Thread(target=publish_url, args=(current_url, [key]), daemon=True).start()
+    if USE_RELAY:
+        start_user_relay(key)
+        if current_url:  # tunnel already up: give the new user the link right away
+            threading.Thread(target=publish_url, args=(current_url, [key]), daemon=True).start()
     return jsonify(id=uid, key=key)
 
 
@@ -698,12 +700,15 @@ def publish_url(url, keys=None):
     key (the admin's and each user's) gets the link on its own topic."""
     if keys is None:
         keys = [API_KEY] + [u["key"] for u in list(USERS.values())]
+    ok = True
     for key in keys:
         try:
             req = urllib.request.Request(f"{NTFY}/{link_topic(key)}", data=url.encode(), method="POST")
             urllib.request.urlopen(req, timeout=10).read()
         except Exception as e:
+            ok = False
             print("Could not publish link:", e, flush=True)
+    return ok
 
 
 # ---- Resource monitor (reads /proc and cgroups; no extra packages) ----
@@ -988,10 +993,39 @@ def poll_admin_bot():
             time.sleep(5)
 
 
-def start_tunnel():
+def get_cloudflared():
+    """Find cloudflared, or download it next to run.py if it is missing."""
     exe = shutil.which("cloudflared")
+    if exe:
+        return exe
+    local = BASE / "cloudflared"
+    if local.exists():
+        return str(local)
+    import platform
+    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64",
+            "arm64": "arm64", "armv7l": "arm", "armv8l": "arm"}.get(platform.machine().lower())
+    if not arch:
+        print("cloudflared: unsupported CPU", platform.machine(), flush=True)
+        return None
+    url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
+    try:
+        print("Downloading cloudflared ...", flush=True)
+        urllib.request.urlretrieve(url, str(local))
+        os.chmod(local, 0o755)
+        return str(local)
+    except Exception as e:
+        print("Could not download cloudflared:", e, flush=True)
+        try:
+            local.unlink()
+        except FileNotFoundError:
+            pass
+        return None
+
+
+def start_tunnel():
+    exe = get_cloudflared()
     if not exe:
-        print("cloudflared not found. Install it first.")
+        print("cloudflared not available. Tunnel skipped.", flush=True)
         return False
     p = subprocess.Popen(
         [exe, "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"],
@@ -1000,8 +1034,8 @@ def start_tunnel():
 
     def republish(url):
         while p.poll() is None:
-            publish_url(url)
-            time.sleep(1800)
+            ok = publish_url(url)
+            time.sleep(1800 if ok else 60)  # failed (e.g. 429)? retry in a minute
 
     def watch():
         announced = False
@@ -1016,7 +1050,8 @@ def start_tunnel():
                 print("==============================================\n", flush=True)
                 name = SERVER_NAME
                 notify_admin(f"{name} is online.\nEnter in app:\n{API_KEY}@{current_url}")
-                threading.Thread(target=republish, args=(current_url,), daemon=True).start()
+                if USE_RELAY:  # only publish the link to ntfy.sh if ntfy is wanted
+                    threading.Thread(target=republish, args=(current_url,), daemon=True).start()
 
     threading.Thread(target=watch, daemon=True).start()
     return True
@@ -1203,9 +1238,10 @@ if __name__ == "__main__":
     tunnel = USE_TUNNEL and start_tunnel()
     threading.Thread(target=stats_loop, daemon=True).start()
     threading.Thread(target=limiter_loop, daemon=True).start()
-    relay = start_relay()
+    relay = USE_RELAY and start_relay()
     name = SERVER_NAME
-    print(f"\n=== Enter this key in the app ===\n{API_KEY}\n=================================")
+    if not tunnel:
+        print(f"\n=== Enter this key in the app ===\n{API_KEY}\n=================================")
     print(f"Relay: {'on' if relay else 'OFF'}   Tunnel: {'on' if tunnel else 'off'}   "
           f"Local API: {f'http://{HOST}:{PORT}' if use_local else 'off'}\n", flush=True)
     if not tunnel:
